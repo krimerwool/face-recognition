@@ -2,20 +2,33 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from PIL import Image
-from PIL.ExifTags import TAGS
 import os  
 import io
+import json
+import re
 from dotenv import load_dotenv
-load_dotenv() 
 
-GEMINI_API_KEY = os.getenv("API_KEY")  # Replace
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 st.set_page_config(page_title="Face Recognition", layout="centered")
 st.title(" Face Recognition & Anti-Spoof System")
 
-KNOWN_FACES_DIR = "known_faces"
+# Define the response schema for structured output
+response_schema = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "status": types.Schema(type=types.Type.STRING),
+        "confidence_score": types.Schema(type=types.Type.INTEGER),
+        "reasoning": types.Schema(type=types.Type.STRING),
+    },
+    required=["status", "confidence_score", "reasoning"]
+)
 
+
+KNOWN_FACES_DIR = "known_faces"
 def prepare_image_for_api(image_path_or_pil):
     """Converts image to the byte format required by the new 2.x SDK."""
     if isinstance(image_path_or_pil, str):
@@ -39,64 +52,70 @@ def get_security_context():
                         parts.append(prepare_image_for_api(os.path.join(p_dir, img)))
                         break
     return parts
+# ... [keep prepare_image_for_api and get_security_context as is] ...
 
 uploaded_file = st.file_uploader("Scan Face", type=["jpg", "png", "jpeg"])
-
 if uploaded_file:
     pil_img = Image.open(uploaded_file)
     st.image(pil_img, caption="Live Feed", width=400)
-    exifdata = pil_img.getexif()
-
-    for tagid in exifdata:
-        
-        # getting the tag name instead of tag id
-        tagname = TAGS.get(tagid, tagid)
-
-        # passing the tagid to get its respective value
-        value = exifdata.get(tagid)
     
-        # printing the final result
-        # st.write(f"{tagname:25}: {value}")
-    
-    # if st.button("Secure Login"):
-    with st.spinner("'Thinking'..."):
+    with st.spinner("Analyzing biometric data..."):
         test_part = prepare_image_for_api(pil_img)
         context = get_security_context()
         
         prompt_parts = [
             *context,
-            "TASK: Analyze this final image for IDENTITY and NOT LIVENESS.",
+            "TASK: Analyze the final image for IDENTITY and SPOOFING.",
             test_part,
             """
             SECURITY PROTOCOL:
-            1. DETECT NON-HUMAN: If the subject is an object, statue, or drawing (e.g., Hanuman ji), return 'BLOCK: NON HUMAN'.
-            2. Check for 'Photo-of-a-photo' or 'Screen-replay' artifacts (glare, pixel grids, moiré).
-                If spoofing is detected, return 'BLOCK: SPOOF ATTEMPT'.
-            3. IDENTITY: If is a confirmed human with no spoof attempt match against known names. 
-                If matched, return 'Match Found: [Name]'.
-                If no match, return 'BLOCK: UNKNOWN USER'.
+            1. Check for 'Photo-of-a-photo' or 'Screen-replay' artifacts.
+            2. IDENTITY: Compare against known users.
             
-            Respond ONLY with the status code.
+            OUTPUT INSTRUCTIONS:
+            - status: 'Match Found: [Name]', 'BLOCK: SPOOF', 'BLOCK: UNKNOWN', or 'BLOCK: NON_HUMAN'.
+            - confidence_score: An integer 0-100 representing how certain you are of the identity match.
+            - reasoning: Brief explanation of the score.
             """
         ]
 
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash", 
-                contents=prompt_parts
+                model="gemini-2.5-flash",
+                contents=prompt_parts,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=response_schema,
+                )
             )
+
+            result_text = response.text.strip()
             
-            res_text = response.text.strip()
+            # Parse JSON response
+            result = json.loads(result_text)
+            status = result.get("status", "BLOCK: UNKNOWN")
+            score = result.get("confidence_score", 0)
+            reasoning = result.get("reasoning", "")
+            
             st.divider()
+
+            # Displaying the Confidence Gauge
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                st.metric("Confidence", f"{score}%")
             
-            if "ALLOW:" in res_text:
-                st.success(f" {res_text}")
-            elif "BLOCK: SPOOF" in res_text:
-                st.error(" SECURITY ALERT: High-confidence spoofing detected (photo-of-a-photo).")
-            elif "BLOCK: NON_HUMAN" in res_text:
-                st.warning(" Invalid Subject: Please present a real human face.")
-            else:
-                st.success(f" {res_text}")
-                
+            with col1:
+                if "Match Found" in status:
+                    st.success(f"**Match Found Successfully:** {status}")
+                    st.progress(score / 100)
+                elif "SPOOF" in status:
+                    st.error(f"**SECURITY ALERT:** {status} (Certainty: {score}%)")
+                else:
+                    st.warning(f"**Match Not Found:** {status}")
+            
+            st.info(f"**Analysis:** {reasoning}")
+
+        except json.JSONDecodeError:
+            st.error("Failed to parse response. Please try again.")
         except Exception as e:
             st.error(f"Error: {e}")
